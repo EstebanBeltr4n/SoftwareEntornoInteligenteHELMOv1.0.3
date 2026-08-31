@@ -1,14 +1,17 @@
 /**
- * HELMO - API de ingestión y consulta MongoDB
- * Archivo: backend/api/api-mongodb.js
+ * HELMO - Puente de telemetría MQTT a MongoDB
+ * Archivo: backend/helmo-bridge/index.js
  * Versión: 1.0.0
  *
  * Descripción:
- * Servicio backend desarrollado en Node.js y Express para:
- * 1. Recibir webhooks HTTP enviados desde The Things Stack.
- * 2. Extraer telemetría decodificada desde decoded_payload.
- * 3. Almacenar lecturas en MongoDB local.
- * 4. Exponer una ruta autenticada para consulta de datos recientes.
+ * Servicio backend encargado de:
+ * 1. Conectarse al broker MQTT de The Things Stack (TTN).
+ * 2. Suscribirse al tópico de uplinks de la aplicación HELMO.
+ * 3. Procesar mensajes con telemetría decodificada.
+ * 4. Construir documentos estructurados con variables y metadatos de radio.
+ * 5. Guardar la información en MongoDB local.
+ * 6. Replicar la información en MongoDB Atlas cuando la nube esté disponible.
+ * 7. Mantener operación degradada y reintentos automáticos si Atlas falla.
  *
  * Autoría:
  * - Esteban Eduardo Escárraga Túquerres
@@ -17,170 +20,251 @@
  */
 
 require('dotenv').config();
-globalThis.crypto = require('node:crypto').webcrypto;
+global.crypto = require('crypto');
 
-const express = require('express');
+const mqtt = require('mqtt');
 const { MongoClient } = require('mongodb');
-const auth = require('basic-auth');
 
-const app = express();
+/* =========================================================
+ * Variables de entorno
+ * ========================================================= */
+const localMongoUrl = process.env.LOCAL_MONGO_URL;
+const localDbName = process.env.LOCAL_DB_NAME || 'helmo_database';
+const localCollectionName =
+  process.env.LOCAL_COLLECTION_NAME || 'monolito_lecturas';
 
-const PORT = Number(process.env.API_PORT || 3001);
-const API_USERNAME = process.env.API_USERNAME;
-const API_PASSWORD = process.env.API_PASSWORD;
+const atlasMongoUrl = process.env.ATLAS_MONGO_URL;
+const atlasDbName = process.env.ATLAS_DB_NAME || 'helmo_database';
+const atlasCollectionName =
+  process.env.ATLAS_COLLECTION_NAME || 'monolito_lecturas';
 
-const MONGO_URL = process.env.MONGO_URL;
-const DB_NAME = process.env.DB_NAME || 'helmo_database';
-const COLLECTION_NAME = process.env.COLLECTION_NAME || 'monolito_lecturas';
+const ttnHost = process.env.TTN_HOST;
+const ttnUsername = process.env.TTN_USERNAME;
+const ttnPassword = process.env.TTN_PASSWORD;
+const ttnTopic = process.env.TTN_TOPIC;
 
-if (!API_USERNAME || !API_PASSWORD || !MONGO_URL) {
+/* =========================================================
+ * Validación mínima de configuración crítica
+ * ========================================================= */
+if (!localMongoUrl || !ttnHost || !ttnUsername || !ttnPassword || !ttnTopic) {
   console.error('❌ Faltan variables de entorno obligatorias.');
-  console.error('Verifica API_USERNAME, API_PASSWORD y MONGO_URL.');
+  console.error(
+    'Verifica LOCAL_MONGO_URL, TTN_HOST, TTN_USERNAME, TTN_PASSWORD y TTN_TOPIC.'
+  );
   process.exit(1);
 }
 
-app.use(express.json());
-
-const mongoClient = new MongoClient(MONGO_URL, {
+/* =========================================================
+ * Clientes MongoDB
+ * ========================================================= */
+const localClient = new MongoClient(localMongoUrl, {
   serverSelectionTimeoutMS: 5000
 });
 
-let collection;
+const atlasClient = atlasMongoUrl
+  ? new MongoClient(atlasMongoUrl, {
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 20000,
+      retryWrites: true,
+      autoSelectFamily: false
+    })
+  : null;
 
-/**
- * Inicializa la conexión a MongoDB y deja lista la colección de trabajo.
- */
-async function initMongo() {
-  await mongoClient.connect();
-  const db = mongoClient.db(DB_NAME);
-  collection = db.collection(COLLECTION_NAME);
-  console.log('✅ Conectado a MongoDB.');
+/* =========================================================
+ * Estado interno del bridge
+ * ========================================================= */
+let localCollection = null;
+let atlasCollection = null;
+let atlasDisponible = false;
+
+/* =========================================================
+ * Conexión a MongoDB local
+ * Base principal de persistencia del sistema
+ * ========================================================= */
+async function conectarMongoLocal() {
+  await localClient.connect();
+  const localDb = localClient.db(localDbName);
+  localCollection = localDb.collection(localCollectionName);
+  console.log('✅ Conectado a MongoDB local.');
 }
 
-/**
- * Middleware de autenticación básica para proteger la ruta de consulta.
- */
-function basicAuthMiddleware(req, res, next) {
-  const credentials = auth(req);
-
-  if (
-    !credentials ||
-    credentials.name !== API_USERNAME ||
-    credentials.pass !== API_PASSWORD
-  ) {
-    res.set('WWW-Authenticate', 'Basic realm="helmo-api"');
-    return res.status(401).send('Acceso denegado');
+/* =========================================================
+ * Conexión inicial a MongoDB Atlas
+ * Si falla, el sistema continúa solo con Mongo local
+ * ========================================================= */
+async function conectarMongoAtlas() {
+  if (!atlasClient) {
+    console.log('ℹ️ Atlas no configurado. El bridge operará solo con Mongo local.');
+    atlasDisponible = false;
+    atlasCollection = null;
+    return;
   }
 
-  next();
+  try {
+    await atlasClient.connect();
+    const atlasDb = atlasClient.db(atlasDbName);
+    atlasCollection = atlasDb.collection(atlasCollectionName);
+    atlasDisponible = true;
+    console.log('✅ Conectado a MongoDB Atlas.');
+  } catch (error) {
+    atlasDisponible = false;
+    atlasCollection = null;
+    console.error(
+      '⚠️ Atlas no disponible al iniciar. El bridge seguirá solo con Mongo local.'
+    );
+    console.error('Detalle Atlas:', error.message);
+  }
 }
 
-/**
- * Ruta de estado básica para verificación local del servicio.
- */
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    servicio: 'helmo-api-mongodb',
-    puerto: PORT
-  });
-});
+/* =========================================================
+ * Reintento de conexión a Atlas
+ * Se ejecuta cuando la base cloud no está disponible
+ * ========================================================= */
+async function reintentarAtlas() {
+  if (atlasDisponible || !atlasClient) return;
 
-/**
- * Ruta de salud para monitoreo del proceso.
- */
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    status: 'up'
-  });
-});
-
-/**
- * Endpoint webhook para recibir telemetría desde TTN.
- * Extrae decoded_payload y guarda un documento estructurado en MongoDB.
- */
-app.post('/datos', async (req, res) => {
   try {
-    console.log('📥 Webhook TTN recibido');
+    await atlasClient.connect();
+    const atlasDb = atlasClient.db(atlasDbName);
+    atlasCollection = atlasDb.collection(atlasCollectionName);
+    atlasDisponible = true;
+    console.log('✅ Reconectado a MongoDB Atlas.');
+  } catch (error) {
+    atlasDisponible = false;
+    atlasCollection = null;
+    console.error('⚠️ Reintento Atlas falló:', error.message);
+  }
+}
 
-    const ttnJson = req.body;
-    const datosSensores = ttnJson.uplink_message?.decoded_payload;
+/* =========================================================
+ * Temporizador periódico de reintento hacia Atlas
+ * Intervalo: 60 segundos
+ * ========================================================= */
+function iniciarReintentoAtlas() {
+  setInterval(async () => {
+    if (!atlasDisponible) {
+      await reintentarAtlas();
+    }
+  }, 60000);
+}
 
-    if (!datosSensores) {
-      console.log('⚠️ Webhook recibido sin decoded_payload');
-      return res.status(200).json({
-        ok: true,
-        warning: 'Webhook sin decoded_payload'
-      });
+/* =========================================================
+ * Persistencia dual del documento de telemetría
+ * 1. Guarda en Mongo local
+ * 2. Intenta replicar en Atlas si está disponible
+ * ========================================================= */
+async function guardarDocumento(documento) {
+  let localId = null;
+  let atlasId = null;
+
+  try {
+    if (!localCollection) {
+      throw new Error('Colección local no inicializada');
     }
 
-    const documento = {
-      dispositivo: ttnJson.end_device_ids?.device_id || 'desconocido',
-      timestamp: ttnJson.received_at
-        ? new Date(ttnJson.received_at)
-        : new Date(),
-      variables: datosSensores,
-      radio_metadata: {
-        fcnt: ttnJson.uplink_message?.f_cnt,
-        rssi: ttnJson.uplink_message?.rx_metadata?.[0]?.rssi,
-        snr: ttnJson.uplink_message?.rx_metadata?.[0]?.snr,
-        gateway: ttnJson.uplink_message?.rx_metadata?.[0]?.gateway_ids?.gateway_id
+    const localRes = await localCollection.insertOne(documento);
+    localId = localRes.insertedId;
+  } catch (err) {
+    console.error('❌ Error guardando en Mongo local:', err.message);
+  }
+
+  if (atlasDisponible && atlasCollection) {
+    try {
+      const atlasRes = await atlasCollection.insertOne(documento);
+      atlasId = atlasRes.insertedId;
+    } catch (err) {
+      atlasDisponible = false;
+      atlasCollection = null;
+      console.error(
+        '⚠️ Error guardando en Mongo Atlas. Se desactiva temporalmente Atlas:',
+        err.message
+      );
+    }
+  }
+
+  console.log(`💾 Local ID: ${localId || 'falló'} | ☁️ Atlas ID: ${atlasId || 'no disponible'}`);
+  console.log(`📡 Device: ${documento.dispositivo} | Variables: ${JSON.stringify(documento.variables)}`);
+}
+
+/* =========================================================
+ * Arranque principal del bridge
+ * ========================================================= */
+async function iniciarPuente() {
+  try {
+    await conectarMongoLocal();
+    await conectarMongoAtlas();
+    iniciarReintentoAtlas();
+
+    const client = mqtt.connect(ttnHost, {
+      username: ttnUsername,
+      password: ttnPassword
+    });
+
+    /* -----------------------------------------
+     * Conexión exitosa al broker MQTT
+     * ----------------------------------------- */
+    client.on('connect', () => {
+      console.log('✅ Conectado al broker MQTT de TTN.');
+
+      client.subscribe(ttnTopic, (err) => {
+        if (!err) {
+          console.log('📡 Suscrito al tópico. Escuchando telemetría...');
+        } else {
+          console.error('❌ Error al suscribirse:', err.message);
+        }
+      });
+    });
+
+    /* -----------------------------------------
+     * Procesamiento de cada mensaje MQTT recibido
+     * ----------------------------------------- */
+    client.on('message', async (_topic, message) => {
+      try {
+        const ttnJson = JSON.parse(message.toString());
+        const datosSensores = ttnJson.uplink_message?.decoded_payload;
+
+        if (!datosSensores) {
+          console.log('⚠️ Uplink sin decoded_payload');
+          return;
+        }
+
+        const documento = {
+          dispositivo: ttnJson.end_device_ids?.device_id || 'desconocido',
+          timestamp: ttnJson.received_at
+            ? new Date(ttnJson.received_at)
+            : new Date(),
+          variables: datosSensores,
+          radio_metadata: {
+            fcnt: ttnJson.uplink_message?.f_cnt,
+            rssi: ttnJson.uplink_message?.rx_metadata?.[0]?.rssi,
+            snr: ttnJson.uplink_message?.rx_metadata?.[0]?.snr,
+            gateway: ttnJson.uplink_message?.rx_metadata?.[0]?.gateway_ids?.gateway_id
+          }
+        };
+
+        await guardarDocumento(documento);
+      } catch (err) {
+        console.error('❌ Error procesando mensaje:', err.message);
       }
-    };
+    });
 
-    const resultado = await collection.insertOne(documento);
-
-    console.log(`💾 Webhook guardado en MongoDB. ID: ${resultado.insertedId}`);
-    console.log(
-      `📡 Device: ${documento.dispositivo} | Variables: ${JSON.stringify(documento.variables)}`
-    );
-
-    return res.status(200).json({
-      ok: true,
-      insertedId: resultado.insertedId
+    /* -----------------------------------------
+     * Manejo de errores del cliente MQTT
+     * ----------------------------------------- */
+    client.on('error', (err) => {
+      console.error('❌ Error MQTT:', err.message);
     });
   } catch (error) {
-    console.error('❌ Error webhook:', error.message);
-    return res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Endpoint autenticado para consultar las últimas lecturas almacenadas.
- */
-app.get('/datos', basicAuthMiddleware, async (req, res) => {
-  try {
-    const data = await collection
-      .find({})
-      .sort({ timestamp: -1 })
-      .limit(100)
-      .toArray();
-
-    return res.json(data);
-  } catch (error) {
-    console.error('❌ Error consultando MongoDB:', error.message);
-    return res.status(500).send('Error al obtener datos');
-  }
-});
-
-/**
- * Inicializa MongoDB y arranca el servidor HTTP.
- */
-async function startServer() {
-  try {
-    await initMongo();
-
-    app.listen(PORT, () => {
-      console.log(`✅ API activa en http://localhost:${PORT}`);
-    });
-  } catch (error) {
-    console.error('❌ Fallo crítico al iniciar la API:', error.message);
+    console.error('❌ Fallo crítico en el arranque del bridge:', error.message);
     process.exit(1);
   }
 }
 
-startServer();
+/* =========================================================
+ * Inicio del servicio
+ * ========================================================= */
+iniciarPuente().catch((err) => {
+  console.error('❌ Error no controlado al iniciar el bridge:', err.message);
+  process.exit(1);
+});
