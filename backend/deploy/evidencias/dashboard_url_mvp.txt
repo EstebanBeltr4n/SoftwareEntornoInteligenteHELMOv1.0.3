@@ -1,0 +1,22 @@
+HELMO - Ejemplo documental de URL pública del dashboard MVP
+
+Tipo de evidencia: URL de ejemplo para documentación del despliegue
+Módulo asociado: backend/deploy
+Servicio expuesto: Grafana local del sistema HELMO
+Mecanismo de exposición: ngrok
+
+URL pública de ejemplo:
+https://helmo-dashboard-demo.ngrok-free.app
+
+Descripción:
+La presente URL se consigna únicamente como ejemplo documental del tipo de enlace público temporal utilizado para exponer el dashboard del MVP HELMO durante fases de demostración, validación o revisión externa. No corresponde necesariamente a una URL activa ni permanente del sistema.
+
+Observaciones:
+- La URL real puede cambiar entre sesiones de ngrok.
+- No deben publicarse aquí credenciales, tokens ni rutas sensibles.
+- Las capturas reales del despliegue deben almacenarse en la carpeta evidencias/capturas/.
+
+Autoría:
+- Esteban Eduardo Escárraga Túquerres
+- Johan Felipe Ordoñez Jenoy
+- Dayerli Katerine Tamayo Solarte
